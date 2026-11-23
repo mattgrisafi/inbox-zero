@@ -288,6 +288,58 @@ describe("createEmailProviderMailboxSource", () => {
     });
   });
 
+  it("pauses instead of requiring reauth on a Gmail quota error mentioning 401", async () => {
+    const quotaError = Object.assign(
+      new Error(
+        "Quota exceeded for quota metric 'Total Query Cost' and limit 'Units per minute per user' of service 'gmail.googleapis.com' for consumer 'project_number:123401456789'.",
+      ),
+      { code: 403, errors: [{ reason: "rateLimitExceeded" }] },
+    );
+    const source = createEmailProviderMailboxSource({
+      accountId: "acc-1",
+      provider: {
+        name: "google",
+        localMailSyncStrategy: "history",
+        async getMailboxSyncPage() {
+          throw quotaError;
+        },
+      } as unknown as EmailProvider,
+    });
+    const result = await source.readChanges({
+      session: { accountId: "acc-1", generation: "g1" },
+      requestId: "r1",
+      position: { streamId: "primary", generation: "g1", checkpoint: "1" },
+      pageSize: 20,
+      signal: new AbortController().signal,
+    });
+    expect(result).toEqual({
+      status: "paused",
+      retryAfterMs: 60_000,
+      reason: "throttled",
+    });
+  });
+
+  it("still requires reauth on a real 401", async () => {
+    const source = createEmailProviderMailboxSource({
+      accountId: "acc-1",
+      provider: {
+        name: "google",
+        localMailSyncStrategy: "history",
+        async getMailboxSyncPage() {
+          throw Object.assign(new Error("Invalid Credentials"), { code: 401 });
+        },
+      } as unknown as EmailProvider,
+    });
+    const result = await source.readChanges({
+      session: { accountId: "acc-1", generation: "g1" },
+      requestId: "r1",
+      position: { streamId: "primary", generation: "g1", checkpoint: "1" },
+      pageSize: 20,
+      signal: new AbortController().signal,
+    });
+    expect(result).toEqual({ status: "blocked_auth" });
+  });
+
   it("does not replace a failed delta cursor with a mailbox list page token", async () => {
     const getMessagesWithPagination = vi.fn();
     const source = createEmailProviderMailboxSource({
@@ -458,6 +510,7 @@ describe("createEmailProviderMailboxSource", () => {
       folderId: "archive",
       pageToken: undefined,
       includeDrafts: true,
+      fetchConcurrency: 3,
     });
     expect(getMailboxSyncPage).toHaveBeenCalledWith({
       after: new Date(0),
@@ -770,9 +823,10 @@ describe("createEmailProviderMailboxSource", () => {
       pageSize: 50,
     });
     expect(getMessagesWithPagination).toHaveBeenCalledWith({
-      maxResults: 50,
+      maxResults: 20,
       pageToken: undefined,
       includeDrafts: true,
+      fetchConcurrency: 3,
     });
   });
 
@@ -811,6 +865,7 @@ describe("createEmailProviderMailboxSource", () => {
       folderId: "inbox",
       pageToken: undefined,
       includeDrafts: true,
+      fetchConcurrency: 3,
     });
   });
 

@@ -1429,6 +1429,7 @@ export class GmailProvider implements EmailProvider {
     inboxOnly?: boolean;
     unreadOnly?: boolean;
     includeDrafts?: boolean;
+    fetchConcurrency?: number;
   }): Promise<{
     messages: ParsedMessage[];
     nextPageToken?: string;
@@ -1463,12 +1464,19 @@ export class GmailProvider implements EmailProvider {
     });
 
     const messages = response.messages || [];
-    const messagePromises = messages.map((message) =>
-      this.getMessage(message.id!),
-    );
+    // Mailbox sync passes a small concurrency so a page of full-message reads
+    // can't exhaust Gmail's per-user-per-minute quota in one burst, with every
+    // read then retrying on its own.
+    const fetched = options.fetchConcurrency
+      ? await mapWithConcurrency(messages, options.fetchConcurrency, (message) =>
+          this.getMessage(message.id!),
+        )
+      : await Promise.all(
+          messages.map((message) => this.getMessage(message.id!)),
+        );
 
     return {
-      messages: await Promise.all(messagePromises),
+      messages: fetched,
       nextPageToken: response.nextPageToken || undefined,
     };
   }

@@ -346,6 +346,8 @@ export interface EmailProvider {
     inboxOnly?: boolean;
     unreadOnly?: boolean;
     includeDrafts?: boolean;
+    /** Max message fetches in flight at once; unbounded when omitted. */
+    fetchConcurrency?: number;
   }): Promise<{
     messages: ParsedMessage[];
     nextPageToken?: string;

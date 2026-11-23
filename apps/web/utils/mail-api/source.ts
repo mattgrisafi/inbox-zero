@@ -22,7 +22,10 @@ import {
   parsedMessagePatch,
 } from "@/utils/mail-api/observations";
 import { isProviderRateLimitModeError } from "@/utils/email/rate-limit-mode-error";
-import { extractErrorInfo as extractGmailErrorInfo } from "@/utils/gmail/retry";
+import {
+  extractErrorInfo as extractGmailErrorInfo,
+  isRetryableError as isGmailRetryableError,
+} from "@/utils/gmail/retry";
 import { OutlookSyncFolderUnavailableError } from "@/utils/outlook/errors";
 import { extractErrorInfo as extractOutlookErrorInfo } from "@/utils/outlook/retry";
 import { getRetryAfterHeaderFromError } from "@/utils/retry/get-retry-after-header";
@@ -34,6 +37,11 @@ import { convertEmailHtmlToText } from "@/utils/mail";
 // Outlook allows four concurrent Graph requests per mailbox, shared with
 // webhook processing, so batched folder reads stay below that.
 const CHANGES_BATCH_CONCURRENCY = 3;
+// Full-message reads in flight per bootstrap page. Unbounded reads made one
+// Gmail page fire 50 requests at once, each retrying on rate limits.
+const BOOTSTRAP_FETCH_CONCURRENCY = 3;
+// Gmail's per-user quota is per minute, so a shorter pause just hits it again.
+const PROVIDER_RATE_LIMIT_RETRY_MS = 60_000;
 
 const SUPPORTED_CHANGES = [
   "archive",
@@ -68,7 +76,9 @@ export function createEmailProviderMailboxSource(input: {
   accountId: string;
 }): MailboxSource & Required<Pick<MailboxSource, "readChangesBatch">> {
   const { provider, accountId } = input;
-  const maxPageSize = provider.name === "microsoft" ? 20 : 50;
+  // Gmail was 50; 20 keeps a full-message page (~5 quota units per message)
+  // well under Gmail's per-user-per-minute quota.
+  const maxPageSize = 20;
   const source: MailboxSource = {
     async describe() {
       return {
@@ -141,6 +151,7 @@ export function createEmailProviderMailboxSource(input: {
           folderId: token.folderId ?? undefined,
           pageToken: token.pageToken,
           includeDrafts: true,
+          fetchConcurrency: BOOTSTRAP_FETCH_CONCURRENCY,
         });
         const { changes, requiredHydration, bodies } = enumeratedObservations(
           accountId,
@@ -586,6 +597,13 @@ function isRejectedProviderRequest(error: unknown) {
   );
 }
 
+function isProviderRateLimitError(error: unknown) {
+  return (
+    isGmailRetryableError(extractGmailErrorInfo(error)).isRateLimit ||
+    extractOutlookErrorInfo(error).status === 429
+  );
+}
+
 function mapProviderError(error: unknown) {
   if (isProviderRateLimitModeError(error)) {
     return {
@@ -594,10 +612,20 @@ function mapProviderError(error: unknown) {
       reason: "throttled" as const,
     };
   }
+  if (isProviderRateLimitError(error)) {
+    return {
+      status: "paused" as const,
+      retryAfterMs: PROVIDER_RATE_LIMIT_RETRY_MS,
+      reason: "throttled" as const,
+    };
+  }
   const message = error instanceof Error ? error.message : "";
   const lowered = message.toLowerCase();
+  // Match the HTTP status, not "401" anywhere in the text: Gmail quota errors
+  // embed the Google project number, which can contain "401".
   if (
-    message.includes("401") ||
+    extractGmailErrorInfo(error).status === 401 ||
+    extractOutlookErrorInfo(error).status === 401 ||
     lowered.includes("unauthorized") ||
     lowered.includes("invalid_grant")
   ) {
