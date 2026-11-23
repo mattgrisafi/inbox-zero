@@ -319,6 +319,27 @@ describe("createEmailProviderMailboxSource", () => {
     });
   });
 
+  it("does not treat a non-auth error mentioning 401 as a sign-in failure", async () => {
+    const source = createEmailProviderMailboxSource({
+      accountId: "acc-1",
+      provider: {
+        name: "google",
+        localMailSyncStrategy: "history",
+        async getMailboxSyncPage() {
+          throw new Error("Backend error for consumer 'project_number:123401456789'");
+        },
+      } as unknown as EmailProvider,
+    });
+    const result = await source.readChanges({
+      session: { accountId: "acc-1", generation: "g1" },
+      requestId: "r1",
+      position: { streamId: "primary", generation: "g1", checkpoint: "1" },
+      pageSize: 20,
+      signal: new AbortController().signal,
+    });
+    expect(result).toMatchObject({ status: "paused", reason: "unavailable" });
+  });
+
   it("still requires reauth on a real 401", async () => {
     const source = createEmailProviderMailboxSource({
       accountId: "acc-1",

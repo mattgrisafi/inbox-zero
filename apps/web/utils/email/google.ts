@@ -1467,13 +1467,22 @@ export class GmailProvider implements EmailProvider {
     // Mailbox sync passes a small concurrency so a page of full-message reads
     // can't exhaust Gmail's per-user-per-minute quota in one burst, with every
     // read then retrying on its own.
-    const fetched = options.fetchConcurrency
-      ? await mapWithConcurrency(messages, options.fetchConcurrency, (message) =>
-          this.getMessage(message.id!),
-        )
-      : await Promise.all(
-          messages.map((message) => this.getMessage(message.id!)),
-        );
+    // After one read fails, the other workers stop instead of spending quota
+    // on reads whose results would be discarded.
+    let failed = false;
+    const fetched = await mapWithConcurrency(
+      messages,
+      options.fetchConcurrency ?? Math.max(messages.length, 1),
+      async (message) => {
+        if (failed) throw new Error("Aborted after an earlier read failed");
+        try {
+          return await this.getMessage(message.id!);
+        } catch (error) {
+          failed = true;
+          throw error;
+        }
+      },
+    );
 
     return {
       messages: fetched,

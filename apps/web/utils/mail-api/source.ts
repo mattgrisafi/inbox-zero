@@ -22,10 +22,7 @@ import {
   parsedMessagePatch,
 } from "@/utils/mail-api/observations";
 import { isProviderRateLimitModeError } from "@/utils/email/rate-limit-mode-error";
-import {
-  extractErrorInfo as extractGmailErrorInfo,
-  isRetryableError as isGmailRetryableError,
-} from "@/utils/gmail/retry";
+import { extractErrorInfo as extractGmailErrorInfo } from "@/utils/gmail/retry";
 import { OutlookSyncFolderUnavailableError } from "@/utils/outlook/errors";
 import { extractErrorInfo as extractOutlookErrorInfo } from "@/utils/outlook/retry";
 import { getRetryAfterHeaderFromError } from "@/utils/retry/get-retry-after-header";
@@ -40,6 +37,9 @@ const CHANGES_BATCH_CONCURRENCY = 3;
 // Full-message reads in flight per bootstrap page. Unbounded reads made one
 // Gmail page fire 50 requests at once, each retrying on rate limits.
 const BOOTSTRAP_FETCH_CONCURRENCY = 3;
+// Bootstrap pages read every message in full (~5 Gmail quota units each), so
+// they stay smaller than list-only pages such as history or search.
+const BOOTSTRAP_MAX_PAGE_SIZE = 20;
 // Gmail's per-user quota is per minute, so a shorter pause just hits it again.
 const PROVIDER_RATE_LIMIT_RETRY_MS = 60_000;
 
@@ -76,9 +76,7 @@ export function createEmailProviderMailboxSource(input: {
   accountId: string;
 }): MailboxSource & Required<Pick<MailboxSource, "readChangesBatch">> {
   const { provider, accountId } = input;
-  // Gmail was 50; 20 keeps a full-message page (~5 quota units per message)
-  // well under Gmail's per-user-per-minute quota.
-  const maxPageSize = 20;
+  const maxPageSize = provider.name === "microsoft" ? 20 : 50;
   const source: MailboxSource = {
     async describe() {
       return {
@@ -147,7 +145,7 @@ export function createEmailProviderMailboxSource(input: {
       try {
         const token = JSON.parse(page) as BootstrapToken;
         const syncPage = await provider.getMessagesWithPagination({
-          maxResults: Math.min(pageSize, maxPageSize),
+          maxResults: Math.min(pageSize, maxPageSize, BOOTSTRAP_MAX_PAGE_SIZE),
           folderId: token.folderId ?? undefined,
           pageToken: token.pageToken,
           includeDrafts: true,
@@ -597,9 +595,19 @@ function isRejectedProviderRequest(error: unknown) {
   );
 }
 
+// Status and reason codes only: message text like "quota exceeded" also
+// appears on non-throttling errors (e.g. a full Outlook mailbox).
+const GMAIL_RATE_LIMIT_REASONS = new Set([
+  "rateLimitExceeded",
+  "userRateLimitExceeded",
+  "quotaExceeded",
+]);
 function isProviderRateLimitError(error: unknown) {
+  const gmail = extractGmailErrorInfo(error);
   return (
-    isGmailRetryableError(extractGmailErrorInfo(error)).isRateLimit ||
+    gmail.status === 429 ||
+    gmail.googleErrorStatus === "RESOURCE_EXHAUSTED" ||
+    (gmail.status === 403 && GMAIL_RATE_LIMIT_REASONS.has(String(gmail.reason))) ||
     extractOutlookErrorInfo(error).status === 429
   );
 }
@@ -627,7 +635,9 @@ function mapProviderError(error: unknown) {
     extractGmailErrorInfo(error).status === 401 ||
     extractOutlookErrorInfo(error).status === 401 ||
     lowered.includes("unauthorized") ||
-    lowered.includes("invalid_grant")
+    lowered.includes("invalid_grant") ||
+    // Gmail batch reads throw this plain Error on a per-item 401.
+    lowered.includes("invalid access token")
   ) {
     return { status: "blocked_auth" as const };
   }
