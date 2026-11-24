@@ -1,6 +1,5 @@
 import { createHash } from "node:crypto";
 import type { gmail_v1 } from "@googleapis/gmail";
-import { MAX_SYNC_PAGE_CHANGES } from "@inboxzero/mail-core/sync";
 import {
   compactMailboxSyncMessage,
   decodeMailboxSyncCursor,
@@ -20,6 +19,12 @@ const GMAIL_MAILBOX_HISTORY_TYPES = [
   "labelAdded",
   "labelRemoved",
 ] as const;
+
+// Message changes fetched per catch-up page. Each costs ~5 Gmail quota units
+// and a page only commits if every fetch succeeds, so pages of up to 1,000
+// (~5,000 units) could hit the 6,000/min per-user quota and restart forever.
+// The cursor keeps the offset, so small pages still make steady progress.
+export const GMAIL_SYNC_PAGE_CHANGES = 50;
 
 export async function getGmailMailboxSyncPage({
   gmail,
@@ -102,7 +107,7 @@ export async function getGmailMailboxSyncPage({
         ? (decoded.changeOffset ?? 0)
         : 0;
     const sliceEnd = Math.min(
-      changeOffset + MAX_SYNC_PAGE_CHANGES,
+      changeOffset + GMAIL_SYNC_PAGE_CHANGES,
       changeUnits.length,
     );
     const slice = changeUnits.slice(changeOffset, sliceEnd);

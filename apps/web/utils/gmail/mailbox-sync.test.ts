@@ -13,6 +13,7 @@ import type { EmailProvider } from "@/utils/email/types";
 import { createEmailProviderMailboxSource } from "@/utils/mail-api/source";
 import { getHistory } from "@/utils/gmail/history";
 import {
+  GMAIL_SYNC_PAGE_CHANGES,
   getGmailMailboxChangeIds,
   getGmailMailboxSyncPage,
 } from "@/utils/gmail/mailbox-sync";
@@ -335,35 +336,37 @@ describe("getGmailMailboxSyncPage", () => {
     const newer = historyRecord({ id: "201", deleted: [addedIds[0]] });
     vi.mocked(getHistory)
       .mockResolvedValueOnce({ history: [original], historyId: "200" })
-      .mockResolvedValueOnce({
+      .mockResolvedValue({
         history: [original, newer],
         historyId: "201",
       });
     stubFetchedMessages();
 
-    const first = await getGmailMailboxSyncPage({
-      gmail: {} as never,
-      accessToken: "access-token",
-      logger,
-      cursor: deltaCursor(),
-      limit: 100,
-    });
-    expect(first.deletedMessageIds).toEqual(deletedIds.slice(0, 300));
-    expect(first.hasMore).toBe(true);
+    const upserted: string[] = [];
+    const deleted: string[] = [];
+    let cursor = deltaCursor();
+    let pages = 0;
+    for (;;) {
+      const page = await getGmailMailboxSyncPage({
+        gmail: {} as never,
+        accessToken: "access-token",
+        logger,
+        cursor,
+        limit: 100,
+      });
+      pages += 1;
+      upserted.push(...page.upsertedMessages.map((message) => message.id));
+      deleted.push(...page.deletedMessageIds);
+      cursor = page.cursor;
+      if (!page.hasMore) break;
+      if (pages > 100) throw new Error("catch-up did not finish");
+    }
 
-    const second = await getGmailMailboxSyncPage({
-      gmail: {} as never,
-      accessToken: "access-token",
-      logger,
-      cursor: first.cursor,
-      limit: 100,
-    });
-
-    expect(second.upsertedMessages).toEqual([]);
-    expect(second.deletedMessageIds).toEqual(deletedIds.slice(300));
-    expect(second.hasMore).toBe(false);
-    const secondCursor = decodeMailboxSyncCursor(second.cursor, "google");
-    expect(secondCursor.historyId).toBe("200");
+    expect(pages).toBe(Math.ceil(1400 / GMAIL_SYNC_PAGE_CHANGES));
+    // The newer record deleting added-0 must wait for the next sync.
+    expect(upserted).toEqual(addedIds);
+    expect(deleted).toEqual(deletedIds);
+    expect(decodeMailboxSyncCursor(cursor, "google").historyId).toBe("200");
   });
 
   it("restarts a page whose contents changed before the saved offset", async () => {
@@ -387,7 +390,7 @@ describe("getGmailMailboxSyncPage", () => {
         phase: "delta",
         historyId: "100",
         after,
-        changeOffset: MAX_SYNC_PAGE_CHANGES,
+        changeOffset: GMAIL_SYNC_PAGE_CHANGES,
         endHistoryId: "200",
         pageFingerprint: "different-page",
       }),
@@ -395,7 +398,7 @@ describe("getGmailMailboxSyncPage", () => {
     });
 
     expect(first.upsertedMessages.map((message) => message.id)).toEqual(
-      addedIds.slice(0, MAX_SYNC_PAGE_CHANGES),
+      addedIds.slice(0, GMAIL_SYNC_PAGE_CHANGES),
     );
     expect(first.hasMore).toBe(true);
 
@@ -408,14 +411,14 @@ describe("getGmailMailboxSyncPage", () => {
     });
 
     expect(second.upsertedMessages.map((message) => message.id)).toEqual(
-      addedIds.slice(MAX_SYNC_PAGE_CHANGES),
+      addedIds.slice(GMAIL_SYNC_PAGE_CHANGES, GMAIL_SYNC_PAGE_CHANGES * 2),
     );
-    expect(second.hasMore).toBe(false);
+    expect(second.hasMore).toBe(true);
   });
 
   it("moves to the next Gmail history page only after the current page is drained", async () => {
     const addedIds = Array.from(
-      { length: 1200 },
+      { length: GMAIL_SYNC_PAGE_CHANGES + 20 },
       (_, index) => `paged-${index}`,
     );
     vi.mocked(getHistory)
@@ -445,7 +448,7 @@ describe("getGmailMailboxSyncPage", () => {
     const firstCursor = decodeMailboxSyncCursor(first.cursor, "google");
     expect(firstCursor).toMatchObject({
       historyId: "100",
-      changeOffset: MAX_SYNC_PAGE_CHANGES,
+      changeOffset: GMAIL_SYNC_PAGE_CHANGES,
     });
     expect(firstCursor.pageToken).toBeUndefined();
 
@@ -567,7 +570,7 @@ describe("Gmail mailbox changes over the mail API source", () => {
       checkpoint: string | null;
     } = { streamId: "primary", generation: "g1", checkpoint: deltaCursor() };
     const changes: ProviderChange[] = [];
-    for (let index = 0; index < 3; index += 1) {
+    for (let index = 0; index < 100; index += 1) {
       const result = await source.readChanges({
         session: { accountId: "acc-1", generation: "g1" },
         requestId: `r${index}`,
